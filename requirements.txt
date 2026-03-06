@@ -1,4 +1,4 @@
-quart==0.19.4
+quart==0.19.9
 quart-cors==0.7.0
 playwright==1.42.0
 requests==2.32.4
