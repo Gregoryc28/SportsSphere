@@ -107,6 +107,20 @@ async def get_all_stream_embeds(match_id: str) -> List[Dict]:
         except Exception:
             continue
 
+    # --- Priority Sorting: fastest/most reliable sources first ---
+    def _embed_sort_key(embed):
+        source = embed.get("source", "").lower()
+        if "admin" in source:
+            return 0
+        if "echo" in source:
+            return 1
+        if "golf" in source:
+            return 2
+        if "delta" in source:
+            return 3
+        return 4
+
+    found_embeds.sort(key=_embed_sort_key)
     return found_embeds
 
 
@@ -460,7 +474,7 @@ async def stream(type, id):
     if not embeds_list:
         return jsonify({"streams": []})
 
-    logging.info(f"Resolving {len(embeds_list)} options concurrently (max 3)...")
+    logging.info(f"Resolving {len(embeds_list)} options concurrently (max 2)...")
 
     # --- Shared Browser + Concurrency Limit ---
     async with async_playwright() as p:
@@ -481,9 +495,30 @@ async def stream(type, id):
                 args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
             )
 
-        semaphore = asyncio.Semaphore(3)
-        tasks = [process_stream_option(e, browser, semaphore) for e in embeds_list]
-        results = await asyncio.gather(*tasks)
+        semaphore = asyncio.Semaphore(2)
+        tasks = [
+            asyncio.create_task(process_stream_option(e, browser, semaphore))
+            for e in embeds_list
+        ]
+
+        # --- Soft Timeout: return whatever resolved within the window ---
+        try:
+            results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=14)
+        except asyncio.TimeoutError:
+            logging.warning("Partial result returned due to timeout")
+            # Cancel any still-pending tasks
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            # Collect results from tasks that already finished
+            results = []
+            for t in tasks:
+                if t.done() and not t.cancelled():
+                    try:
+                        results.append(t.result())
+                    except Exception:
+                        results.append(None)
+
         await browser.close()
 
     valid_streams = [r for r in results if r]
