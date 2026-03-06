@@ -333,7 +333,7 @@ async def manifest():
     return jsonify(
         {
             "id": "org.stremio.sportssphere",
-            "version": "1.0.4",
+            "version": "1.1.0",
             "name": "Sports Sphere",
             "description": "Aggregated Live Sports Events (Multi-Source)",
             "logo": host_url,
