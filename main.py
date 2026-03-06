@@ -110,134 +110,128 @@ async def get_all_stream_embeds(match_id: str) -> List[Dict]:
     return found_embeds
 
 
-async def resolve_with_playwright(embed_url: str) -> Optional[Dict]:
-    logging.info(f"Launching Playwright for Embed: {embed_url}")
+async def resolve_with_playwright(embed_url: str, browser) -> Optional[Dict]:
+    """Resolve an embed URL using a shared browser instance."""
+    logging.info(f"Resolving Embed: {embed_url}")
     stream_info = {}
 
     parsed_uri = urlparse(embed_url)
     clean_root = "{uri.scheme}://{uri.netloc}/".format(uri=parsed_uri)
     clean_origin = "{uri.scheme}://{uri.netloc}".format(uri=parsed_uri)
 
-    async with async_playwright() as p:
-        try:
-            browser = await p.chromium.launch(
-                headless=True,
-                channel="chrome",
-                args=[
-                    "--no-sandbox",
-                    "--disable-gpu",
-                    "--mute-audio",
-                    "--disable-blink-features=AutomationControlled",
-                ],
-            )
-        except:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
-            )
+    user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    context = await browser.new_context(user_agent=user_agent)
+    page = await context.new_page()
 
-        user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-        context = await browser.new_context(user_agent=user_agent)
-        page = await context.new_page()
+    # --- Resource Blocking: Only load HTML/JS, skip everything else ---
+    BLOCKED_RESOURCE_TYPES = {"image", "stylesheet", "font", "media", "other"}
 
-        async def handle_popup(popup):
-            if popup != page:
-                try:
-                    await popup.close()
-                except:
-                    pass
+    async def block_unnecessary_resources(route):
+        if route.request.resource_type in BLOCKED_RESOURCE_TYPES:
+            await route.abort()
+        else:
+            await route.continue_()
 
-        context.on("page", handle_popup)
+    await page.route("**/*", block_unnecessary_resources)
 
-        async def handle_request(request):
-            # Atomic Check: If we already have the URL, stop processing
-            if "url" in stream_info:
+    async def handle_popup(popup):
+        if popup != page:
+            try:
+                await popup.close()
+            except:
+                pass
+
+    context.on("page", handle_popup)
+
+    async def handle_request(request):
+        # Atomic Check: If we already have the URL, stop processing
+        if "url" in stream_info:
+            return
+
+        if ".m3u" in request.url and "http" in request.url:
+            if "narakathegame" in request.url:
                 return
 
-            if ".m3u" in request.url and "http" in request.url:
-                if "narakathegame" in request.url:
-                    return
+            logging.info(f"SUCCESS! Found Stream Candidate: {request.url}")
+            try:
+                # 1. CRITICAL: Grab headers BEFORE setting stream_info['url']
+                # This prevents the browser from closing until we have the data.
+                headers = await request.all_headers()
+                cookies = headers.get("cookie", headers.get("Cookie", ""))
 
-                logging.info(f"SUCCESS! Found Stream Candidate: {request.url}")
+                actual_referer = headers.get("referer", embed_url)
+                final_headers = {
+                    "User-Agent": user_agent,
+                    "Cookie": cookies,
+                    "Referer": actual_referer,
+                    "Origin": clean_origin,
+                }
+
+                if "strmd" in request.url or "delta" in request.url:
+                    final_headers["Referer"] = clean_root
+                    if "Origin" in final_headers:
+                        del final_headers["Origin"]
+
+                # 2. SAVE DATA
+                stream_info["headers"] = final_headers
+                stream_info["clean_root"] = clean_root
+
+                # 3. SET URL LAST (This signals the main loop that we are done)
+                stream_info["url"] = request.url
+
+            except Exception as e:
+                logging.warning(f"Could not grab headers (Retrying...): {e}")
+
+    page.on("request", handle_request)
+
+    try:
+        await page.goto(embed_url, wait_until="domcontentloaded", timeout=25000)
+
+        for i in range(5):
+            # Check if we found it (headers are guaranteed to be there if URL is set)
+            if "url" in stream_info:
+                break
+
+            try:
+                await page.mouse.click(500, 300)
+            except:
+                pass
+            await asyncio.sleep(1.0)
+
+            target = page
+            for frame in page.frames:
+                if (
+                    "embed" in frame.url
+                    or "poo" in frame.url
+                    or "exposestrat" in frame.url
+                    or "maestro" in frame.url
+                ):
+                    target = frame
+
+            buttons = [
+                "button.vjs-big-play-button",
+                ".play-button",
+                "div.play",
+                "svg",
+                "video",
+                "#player",
+                ".jw-icon-playback",
+            ]
+            for btn in buttons:
                 try:
-                    # 1. CRITICAL: Grab headers BEFORE setting stream_info['url']
-                    # This prevents the browser from closing until we have the data.
-                    headers = await request.all_headers()
-                    cookies = headers.get("cookie", headers.get("Cookie", ""))
-
-                    actual_referer = headers.get("referer", embed_url)
-                    final_headers = {
-                        "User-Agent": user_agent,
-                        "Cookie": cookies,
-                        "Referer": actual_referer,
-                        "Origin": clean_origin,
-                    }
-
-                    if "strmd" in request.url or "delta" in request.url:
-                        final_headers["Referer"] = clean_root
-                        if "Origin" in final_headers:
-                            del final_headers["Origin"]
-
-                    # 2. SAVE DATA
-                    stream_info["headers"] = final_headers
-                    stream_info["clean_root"] = clean_root
-
-                    # 3. SET URL LAST (This signals the main loop that we are done)
-                    stream_info["url"] = request.url
-
-                except Exception as e:
-                    logging.warning(f"Could not grab headers (Retrying...): {e}")
-
-        page.on("request", handle_request)
-
-        try:
-            await page.goto(embed_url, wait_until="domcontentloaded", timeout=25000)
-
-            for i in range(5):
-                # Check if we found it (headers are guaranteed to be there if URL is set)
-                if "url" in stream_info:
-                    break
-
-                try:
-                    await page.mouse.click(500, 300)
+                    if (
+                        await target.locator(btn).count() > 0
+                        and await target.locator(btn).first.is_visible()
+                    ):
+                        await target.locator(btn).first.click(timeout=500)
                 except:
                     pass
-                await asyncio.sleep(1.0)
+            await asyncio.sleep(1.5)
 
-                target = page
-                for frame in page.frames:
-                    if (
-                        "embed" in frame.url
-                        or "poo" in frame.url
-                        or "exposestrat" in frame.url
-                        or "maestro" in frame.url
-                    ):
-                        target = frame
-
-                buttons = [
-                    "button.vjs-big-play-button",
-                    ".play-button",
-                    "div.play",
-                    "svg",
-                    "video",
-                    "#player",
-                    ".jw-icon-playback",
-                ]
-                for btn in buttons:
-                    try:
-                        if (
-                            await target.locator(btn).count() > 0
-                            and await target.locator(btn).first.is_visible()
-                        ):
-                            await target.locator(btn).first.click(timeout=500)
-                    except:
-                        pass
-                await asyncio.sleep(1.5)
-
-        except Exception as e:
-            logging.error(f"Playwright error: {e}")
-
-        await browser.close()
+    except Exception as e:
+        logging.error(f"Playwright error: {e}")
+    finally:
+        await context.close()
 
     return stream_info
 
@@ -339,7 +333,7 @@ async def manifest():
     return jsonify(
         {
             "id": "org.stremio.sportssphere",
-            "version": "1.0.3",
+            "version": "1.0.4",
             "name": "Sports Sphere",
             "description": "Aggregated Live Sports Events (Multi-Source)",
             "logo": host_url,
@@ -390,7 +384,7 @@ async def catalog(type, id, genre=None):
 
 
 # --- WORKER ---
-async def process_stream_option(embed_data):
+async def process_stream_option(embed_data, browser, semaphore):
     embed_url = embed_data["embed_url"]
     label = embed_data["label"]
 
@@ -398,7 +392,8 @@ async def process_stream_option(embed_data):
     if label.startswith("Admin"):
         label = label.replace("Admin", "Alpha")
 
-    data = await resolve_with_playwright(embed_url)
+    async with semaphore:
+        data = await resolve_with_playwright(embed_url, browser)
     if not data or "url" not in data:
         return None
 
@@ -465,10 +460,32 @@ async def stream(type, id):
     if not embeds_list:
         return jsonify({"streams": []})
 
-    logging.info(f"Resolving {len(embeds_list)} options concurrently...")
+    logging.info(f"Resolving {len(embeds_list)} options concurrently (max 3)...")
 
-    tasks = [process_stream_option(e) for e in embeds_list]
-    results = await asyncio.gather(*tasks)
+    # --- Shared Browser + Concurrency Limit ---
+    async with async_playwright() as p:
+        try:
+            browser = await p.chromium.launch(
+                headless=True,
+                channel="chrome",
+                args=[
+                    "--no-sandbox",
+                    "--disable-gpu",
+                    "--mute-audio",
+                    "--disable-blink-features=AutomationControlled",
+                ],
+            )
+        except Exception:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+            )
+
+        semaphore = asyncio.Semaphore(3)
+        tasks = [process_stream_option(e, browser, semaphore) for e in embeds_list]
+        results = await asyncio.gather(*tasks)
+        await browser.close()
+
     valid_streams = [r for r in results if r]
 
     if not valid_streams:
