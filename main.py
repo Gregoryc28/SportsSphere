@@ -110,11 +110,11 @@ async def get_all_stream_embeds(match_id: str) -> List[Dict]:
     # --- Priority Sorting: fastest/most reliable sources first ---
     def _embed_sort_key(embed):
         source = embed.get("source", "").lower()
-        if "admin" in source:
-            return 0
-        if "echo" in source:
-            return 1
         if "golf" in source:
+            return 0
+        if "admin" in source:
+            return 1
+        if "delta" in source:
             return 2
         if "delta" in source:
             return 3
