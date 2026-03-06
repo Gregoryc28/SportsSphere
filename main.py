@@ -116,9 +116,7 @@ async def get_all_stream_embeds(match_id: str) -> List[Dict]:
             return 1
         if "delta" in source:
             return 2
-        if "delta" in source:
-            return 3
-        return 4
+        return 3
 
     found_embeds.sort(key=_embed_sort_key)
     return found_embeds
