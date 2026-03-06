@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  sports-sphere:
+    build: .
+    container_name: sports-sphere
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - PORT=8000
+      # Add your custom config here if needed later
+      # - LOG_LEVEL=INFO
+    volumes:
+      # Optional: Persist the cache if you want to save it between restarts
+      - ./cache:/app/cache

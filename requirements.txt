@@ -1,0 +1,7 @@
+quart==0.19.4
+quart-cors==0.7.0
+playwright==1.42.0
+requests==2.32.4
+beautifulsoup4==4.12.3
+curl-cffi==0.14.0
+uvicorn
