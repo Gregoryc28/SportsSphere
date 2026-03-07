@@ -99,7 +99,7 @@ Before you begin, make sure you have the following depending on which setup meth
 
 ## 🐳 Setup — Option 1: Docker (Recommended)
 
-Docker is the easiest and most reliable way to run Sports Sphere. The Dockerfile is pre-configured with the official Microsoft Playwright image, so Chromium and all its dependencies are handled automatically.
+Docker is the easiest and most reliable way to run Sports Sphere. The Dockerfile is pre-configured with the official Microsoft Playwright image and installs Google Chrome for Playwright, with Chromium kept as a fallback.
 
 ### Step 1: Clone the Repository
 
@@ -137,7 +137,8 @@ docker-compose up -d --build
 This will:
 - Build the Docker image from the `Dockerfile`
 - Install all Python dependencies from `requirements.txt`
-- Install Chromium inside the container
+- Install Google Chrome inside the container for Playwright
+- Keep Chromium available as a fallback browser
 - Start the server on port **8000**
 - Automatically restart the container if it crashes
 
