@@ -560,6 +560,7 @@ async def process_stream_option(embed_data, browser, semaphore):
     embed_url = embed_data["embed_url"]
     label = embed_data["label"]
     source = embed_data.get("source", "")
+    stream_no = embed_data.get("stream_no")
     queued_at = time.time()
 
     # If label starts with "Admin", change "Admin" text to "Alpha"
@@ -645,10 +646,8 @@ async def process_stream_option(embed_data, browser, semaphore):
             },
         }
 
-    is_strict = (
-        "strmd.top" in stream_url
-        or "delta" in stream_url
-    )
+    is_alpha_one = source.lower() == "admin" and stream_no == 1
+    is_strict = "strmd.top" in stream_url or "delta" in stream_url or is_alpha_one
 
     if is_strict:
         proxy_headers = normalized_headers.copy()
