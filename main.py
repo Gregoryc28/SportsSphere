@@ -36,6 +36,14 @@ PER_EMBED_TIMEOUT = float(os.environ.get("PER_EMBED_TIMEOUT", "25"))
 PLAYWRIGHT_INTERACTION_ATTEMPTS = int(
     os.environ.get("PLAYWRIGHT_INTERACTION_ATTEMPTS", "7")
 )
+RESOLVER_DEBUG = os.environ.get("RESOLVER_DEBUG", "").lower() in {"1", "true", "yes"}
+RESOLVER_DEBUG_SOURCES = {
+    source.strip().lower()
+    for source in os.environ.get("RESOLVER_DEBUG_SOURCES", "").split(",")
+    if source.strip()
+}
+PLAYWRIGHT_LOCALE = os.environ.get("PLAYWRIGHT_LOCALE", "en-US")
+PLAYWRIGHT_TIMEZONE = os.environ.get("PLAYWRIGHT_TIMEZONE", "America/Chicago")
 
 # Global Caches
 catalog_cache = {}
@@ -47,6 +55,16 @@ stream_cache = {}
 def sign_url(url: str) -> str:
     """Generate an HMAC-SHA256 signature for a proxy URL."""
     return hmac.new(SECRET_KEY.encode(), url.encode(), hashlib.sha256).hexdigest()
+
+
+def should_debug_resolver(source: str) -> bool:
+    if not RESOLVER_DEBUG:
+        return False
+
+    if not RESOLVER_DEBUG_SOURCES:
+        return True
+
+    return source.lower() in RESOLVER_DEBUG_SOURCES
 
 
 async def get_all_matches() -> List[Dict]:
@@ -157,10 +175,47 @@ async def get_all_stream_embeds(match_id: str) -> List[Dict]:
     return interleaved_embeds
 
 
-async def resolve_with_playwright(embed_url: str, browser) -> Optional[Dict]:
+async def resolve_with_playwright(
+    embed_url: str, browser, source: str = "", label: str = ""
+) -> Optional[Dict]:
     """Resolve an embed URL using a shared browser instance."""
     logging.info(f"Resolving Embed: {embed_url}")
     stream_info = {}
+    debug_enabled = should_debug_resolver(source)
+    debug_state = {
+        "attempts": [],
+        "console": [],
+        "page_errors": [],
+        "request_failures": [],
+        "responses": [],
+    }
+
+    def append_debug(bucket: str, value, limit: int = 8):
+        if not debug_enabled:
+            return
+
+        if len(debug_state[bucket]) < limit:
+            debug_state[bucket].append(value)
+
+    def log_debug_summary(reason: str):
+        if not debug_enabled:
+            return
+
+        frame_urls = [frame.url for frame in page.frames if frame.url][:8]
+        logging.info(
+            "Resolver debug: source=%s label=%s reason=%s embed=%s page_url=%s frames=%s attempts=%s console=%s page_errors=%s request_failures=%s responses=%s",
+            source,
+            label,
+            reason,
+            embed_url,
+            page.url,
+            frame_urls,
+            debug_state["attempts"],
+            debug_state["console"],
+            debug_state["page_errors"],
+            debug_state["request_failures"],
+            debug_state["responses"],
+        )
 
     parsed_uri = urlparse(embed_url)
     clean_root = "{uri.scheme}://{uri.netloc}/".format(uri=parsed_uri)
@@ -171,6 +226,56 @@ async def resolve_with_playwright(embed_url: str, browser) -> Optional[Dict]:
         user_agent=user_agent,
         viewport={"width": 1366, "height": 768},
         ignore_https_errors=True,
+        locale=PLAYWRIGHT_LOCALE,
+        timezone_id=PLAYWRIGHT_TIMEZONE,
+    )
+    await context.set_extra_http_headers(
+        {
+            "Accept-Language": "en-US,en;q=0.9",
+            "Upgrade-Insecure-Requests": "1",
+        }
+    )
+    await context.add_init_script(
+        """
+        Object.defineProperty(navigator, 'webdriver', {
+            get: () => undefined,
+        });
+
+        Object.defineProperty(navigator, 'platform', {
+            get: () => 'Win32',
+        });
+
+        Object.defineProperty(navigator, 'languages', {
+            get: () => ['en-US', 'en'],
+        });
+
+        Object.defineProperty(navigator, 'hardwareConcurrency', {
+            get: () => 8,
+        });
+
+        Object.defineProperty(navigator, 'deviceMemory', {
+            get: () => 8,
+        });
+
+        Object.defineProperty(navigator, 'plugins', {
+            get: () => [1, 2, 3, 4, 5],
+        });
+
+        window.chrome = window.chrome || {
+            runtime: {},
+            loadTimes: () => {},
+            csi: () => {},
+        };
+
+        const originalQuery = window.navigator.permissions && window.navigator.permissions.query;
+        if (originalQuery) {
+            window.navigator.permissions.query = (parameters) => (
+                parameters && parameters.name === 'notifications'
+                    ? Promise.resolve({ state: Notification.permission })
+                    : originalQuery(parameters)
+            );
+        }
+        """
     )
     page = await context.new_page()
 
@@ -195,7 +300,51 @@ async def resolve_with_playwright(embed_url: str, browser) -> Optional[Dict]:
             except:
                 pass
 
+    def handle_console(message):
+        if message.type in {"warning", "error"}:
+            append_debug(
+                "console",
+                {
+                    "type": message.type,
+                    "text": message.text,
+                },
+            )
+
+    def handle_page_error(error):
+        append_debug("page_errors", str(error))
+
+    def handle_request_failed(failed_request):
+        append_debug(
+            "request_failures",
+            {
+                "resource_type": failed_request.resource_type,
+                "url": failed_request.url,
+                "failure": str(failed_request.failure),
+            },
+        )
+
+    def handle_response(response):
+        if response.request.resource_type not in {"document", "fetch", "xhr", "media"}:
+            return
+
+        response_url = response.url
+        if not debug_enabled and ".m3u" not in response_url:
+            return
+
+        append_debug(
+            "responses",
+            {
+                "resource_type": response.request.resource_type,
+                "status": response.status,
+                "url": response_url,
+            },
+        )
+
     context.on("page", handle_popup)
+    page.on("console", handle_console)
+    page.on("pageerror", handle_page_error)
+    page.on("requestfailed", handle_request_failed)
+    page.on("response", handle_response)
 
     async def handle_request(request):
         # Atomic Check: If we already have the URL, stop processing
@@ -245,7 +394,7 @@ async def resolve_with_playwright(embed_url: str, browser) -> Optional[Dict]:
         except Exception:
             pass
 
-        for _ in range(PLAYWRIGHT_INTERACTION_ATTEMPTS):
+        for attempt in range(PLAYWRIGHT_INTERACTION_ATTEMPTS):
             # Check if we found it (headers are guaranteed to be there if URL is set)
             if "url" in stream_info:
                 break
@@ -282,15 +431,24 @@ async def resolve_with_playwright(embed_url: str, browser) -> Optional[Dict]:
                 "button[aria-label='Play']",
                 "button",
             ]
+            visible_buttons = []
             for btn in buttons:
                 try:
-                    if (
-                        await target.locator(btn).count() > 0
-                        and await target.locator(btn).first.is_visible()
-                    ):
-                        await target.locator(btn).first.click(timeout=1000, force=True)
+                    locator = target.locator(btn)
+                    if await locator.count() > 0 and await locator.first.is_visible():
+                        visible_buttons.append(btn)
+                        await locator.first.click(timeout=1000, force=True)
                 except:
                     pass
+
+            append_debug(
+                "attempts",
+                {
+                    "attempt": attempt + 1,
+                    "target_url": getattr(target, "url", page.url),
+                    "visible_buttons": visible_buttons[:6],
+                },
+            )
 
             try:
                 await target.evaluate(
@@ -324,7 +482,11 @@ async def resolve_with_playwright(embed_url: str, browser) -> Optional[Dict]:
 
             await asyncio.sleep(1.5)
 
+        if "url" not in stream_info:
+            log_debug_summary("no_stream")
+
     except Exception as e:
+        log_debug_summary(f"exception:{e}")
         logging.error(f"Playwright error: {e}")
     finally:
         await context.close()
@@ -510,7 +672,8 @@ async def process_stream_option(embed_data, browser, semaphore):
                 started_at,
             )
             data = await asyncio.wait_for(
-                resolve_with_playwright(embed_url, browser), timeout=PER_EMBED_TIMEOUT
+                resolve_with_playwright(embed_url, browser, source, label),
+                timeout=PER_EMBED_TIMEOUT,
             )
     except asyncio.TimeoutError:
         logging.warning(
