@@ -33,6 +33,9 @@ SECRET_KEY = os.environ.get("PROXY_SECRET_KEY", "change-me-to-a-real-secret")
 MAX_CONCURRENT_RESOLVERS = int(os.environ.get("MAX_CONCURRENT_RESOLVERS", "2"))
 STREAM_RESOLUTION_TIMEOUT = float(os.environ.get("STREAM_RESOLUTION_TIMEOUT", "45"))
 PER_EMBED_TIMEOUT = float(os.environ.get("PER_EMBED_TIMEOUT", "25"))
+PLAYWRIGHT_INTERACTION_ATTEMPTS = int(
+    os.environ.get("PLAYWRIGHT_INTERACTION_ATTEMPTS", "7")
+)
 
 # Global Caches
 catalog_cache = {}
@@ -135,11 +138,15 @@ async def resolve_with_playwright(embed_url: str, browser) -> Optional[Dict]:
     clean_origin = "{uri.scheme}://{uri.netloc}".format(uri=parsed_uri)
 
     user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-    context = await browser.new_context(user_agent=user_agent)
+    context = await browser.new_context(
+        user_agent=user_agent,
+        viewport={"width": 1366, "height": 768},
+        ignore_https_errors=True,
+    )
     page = await context.new_page()
 
     # --- Resource Blocking: Only load HTML/JS, skip everything else ---
-    BLOCKED_RESOURCE_TYPES = {"image", "stylesheet", "font", "media", "other"}
+    BLOCKED_RESOURCE_TYPES = {"image", "stylesheet", "font", "media"}
 
     async def block_unnecessary_resources(route):
         if route.request.resource_type in BLOCKED_RESOURCE_TYPES:
@@ -201,14 +208,18 @@ async def resolve_with_playwright(embed_url: str, browser) -> Optional[Dict]:
 
     try:
         await page.goto(embed_url, wait_until="domcontentloaded", timeout=25000)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=5000)
+        except Exception:
+            pass
 
-        for i in range(5):
+        for _ in range(PLAYWRIGHT_INTERACTION_ATTEMPTS):
             # Check if we found it (headers are guaranteed to be there if URL is set)
             if "url" in stream_info:
                 break
 
             try:
-                await page.mouse.click(500, 300)
+                await page.mouse.click(683, 384)
             except:
                 pass
             await asyncio.sleep(1.0)
@@ -220,6 +231,9 @@ async def resolve_with_playwright(embed_url: str, browser) -> Optional[Dict]:
                     or "poo" in frame.url
                     or "exposestrat" in frame.url
                     or "maestro" in frame.url
+                    or "player" in frame.url
+                    or "watch" in frame.url
+                    or "stream" in frame.url
                 ):
                     target = frame
 
@@ -231,6 +245,10 @@ async def resolve_with_playwright(embed_url: str, browser) -> Optional[Dict]:
                 "video",
                 "#player",
                 ".jw-icon-playback",
+                ".jwplayer",
+                ".plyr__control--overlaid",
+                "button[aria-label='Play']",
+                "button",
             ]
             for btn in buttons:
                 try:
@@ -238,9 +256,40 @@ async def resolve_with_playwright(embed_url: str, browser) -> Optional[Dict]:
                         await target.locator(btn).count() > 0
                         and await target.locator(btn).first.is_visible()
                     ):
-                        await target.locator(btn).first.click(timeout=500)
+                        await target.locator(btn).first.click(timeout=1000, force=True)
                 except:
                     pass
+
+            try:
+                await target.evaluate(
+                    """() => {
+                        const candidates = document.querySelectorAll(
+                            'video, button, .play-button, .jw-icon-playback, #player, .jwplayer, .plyr__control--overlaid'
+                        );
+                        for (const element of candidates) {
+                            try {
+                                element.dispatchEvent(new MouseEvent('click', {
+                                    bubbles: true,
+                                    cancelable: true,
+                                    view: window,
+                                }));
+                            } catch (e) {}
+                        }
+
+                        for (const video of document.querySelectorAll('video')) {
+                            try {
+                                video.muted = true;
+                                const playPromise = video.play();
+                                if (playPromise && typeof playPromise.catch === 'function') {
+                                    playPromise.catch(() => {});
+                                }
+                            } catch (e) {}
+                        }
+                    }"""
+                )
+            except:
+                pass
+
             await asyncio.sleep(1.5)
 
     except Exception as e:
