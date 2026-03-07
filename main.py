@@ -631,7 +631,7 @@ async def catalog(type, id, genre=None):
                 "type": "movie",
                 "name": m["title"],
                 "poster": get_poster_url(m),
-                "description": f"Live on Streamed.pk - {m.get('category', 'Sports')}",
+                "description": f"Live Sport \u2014 {m.get('category', 'Sports')}",
                 "genre": [m.get("category", "Misc")],
                 "behaviorHints": {"defaultVideoId": f"pk_{m['id']}"},
             }
@@ -926,7 +926,7 @@ async def meta(type, id):
                     "name": match["title"],
                     "poster": poster,
                     "background": poster,
-                    "description": f"LIVE SPORT\nCategory: {match.get('category')}\nStart Time: {start_time}",
+                    "description": f"Live Sport \u2014 {match.get('category')}\nStart Time: {start_time}",
                 }
             }
         )
