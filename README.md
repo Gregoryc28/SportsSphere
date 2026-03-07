@@ -241,7 +241,7 @@ This installs:
 | `quart` | Async web framework (the server) |
 | `quart-cors` | CORS support for Stremio compatibility |
 | `playwright` | Headless browser for stream resolving |
-| `requests` | HTTP client for API calls |
+| `httpx` | Async HTTP client for upstream API calls |
 | `beautifulsoup4` | HTML parsing utilities |
 | `curl-cffi` | TLS-impersonating HTTP client for the proxy |
 | `uvicorn` | ASGI server to run the app in production |
@@ -299,7 +299,7 @@ For better performance with multiple workers:
 uvicorn main:app --host 0.0.0.0 --port 8000 --workers 2
 ```
 
-> ⚠️ **Note on Workers**: Playwright can be memory-intensive. Each worker spawns its own headless browser instances. Start with 1–2 workers and monitor your system's RAM usage. A single worker is fine for personal use.
+> ⚠️ **Note on Workers**: Playwright can be memory-intensive. For most self-hosted setups, a single worker is the safest default.
 
 ### Step 7: Verify It's Running
 
@@ -377,7 +377,7 @@ Once your server is running, you need to add it to Stremio:
 
 - Playwright (headless Chromium) is memory-intensive. Each stream resolution spawns a browser instance.
 - Ensure your server has at least **1 GB of RAM** (2 GB recommended).
-- If running with `uvicorn`, reduce the number of workers.
+- If running with `uvicorn`, try a single worker first.
 </details>
 
 <details>

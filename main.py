@@ -9,7 +9,7 @@ import os
 from typing import Dict, List, Optional
 from urllib.parse import quote, unquote, urljoin, urlparse
 
-import requests
+import httpx
 from quart import Quart, jsonify, send_from_directory, url_for, request, Response
 from quart_cors import cors
 from playwright.async_api import async_playwright
@@ -31,6 +31,11 @@ CACHE_TIMEOUT = 300
 STREAM_CACHE_DURATION = 900
 SECRET_KEY = os.environ.get("PROXY_SECRET_KEY", "change-me-to-a-real-secret")
 MAX_CONCURRENT_RESOLVERS = int(os.environ.get("MAX_CONCURRENT_RESOLVERS", "2"))
+MAX_GLOBAL_CONCURRENT_RESOLVERS = int(
+    os.environ.get(
+        "MAX_GLOBAL_CONCURRENT_RESOLVERS", str(MAX_CONCURRENT_RESOLVERS)
+    )
+)
 STREAM_RESOLUTION_TIMEOUT = float(os.environ.get("STREAM_RESOLUTION_TIMEOUT", "55"))
 PER_EMBED_TIMEOUT = float(os.environ.get("PER_EMBED_TIMEOUT", "25"))
 PLAYWRIGHT_INTERACTION_ATTEMPTS = int(
@@ -42,6 +47,13 @@ PLAYWRIGHT_TIMEZONE = os.environ.get("PLAYWRIGHT_TIMEZONE", "America/Chicago")
 # Global Caches
 catalog_cache = {}
 stream_cache = {}
+catalog_cache_lock = asyncio.Lock()
+stream_cache_lock = asyncio.Lock()
+upstream_client_lock = asyncio.Lock()
+in_flight_streams_lock = asyncio.Lock()
+in_flight_stream_requests = {}
+global_resolver_semaphore = asyncio.Semaphore(MAX_GLOBAL_CONCURRENT_RESOLVERS)
+upstream_client: Optional[httpx.AsyncClient] = None
 
 # --- Helper Functions ---
 
@@ -49,6 +61,30 @@ stream_cache = {}
 def sign_url(url: str) -> str:
     """Generate an HMAC-SHA256 signature for a proxy URL."""
     return hmac.new(SECRET_KEY.encode(), url.encode(), hashlib.sha256).hexdigest()
+
+
+async def get_upstream_client() -> httpx.AsyncClient:
+    global upstream_client
+
+    if upstream_client is not None:
+        return upstream_client
+
+    async with upstream_client_lock:
+        if upstream_client is None:
+            upstream_client = httpx.AsyncClient(follow_redirects=True)
+
+    return upstream_client
+
+
+@app.after_serving
+async def close_upstream_client() -> None:
+    global upstream_client
+
+    if upstream_client is None:
+        return
+
+    await upstream_client.aclose()
+    upstream_client = None
 
 
 def normalize_stream_headers(
@@ -66,23 +102,50 @@ def normalize_stream_headers(
 
 async def get_all_matches() -> List[Dict]:
     global catalog_cache
+
+    async with catalog_cache_lock:
+        current_time = time.time()
+
+        if catalog_cache and (
+            current_time - catalog_cache.get("last_updated", 0) < CACHE_TIMEOUT
+        ):
+            return catalog_cache["data"]
+
+        try:
+            client = await get_upstream_client()
+            resp = await client.get(f"{API_BASE}/matches/all-today", timeout=10.0)
+            resp.raise_for_status()
+            data = resp.json()
+            data.sort(key=lambda x: x.get("date", 0))
+            catalog_cache = {"last_updated": current_time, "data": data}
+            return data
+        except Exception as e:
+            logging.error(f"Failed to fetch matches: {e}")
+            return catalog_cache.get("data", [])
+
+
+async def get_cached_streams(match_id: str) -> Optional[List[Dict]]:
     current_time = time.time()
 
-    if catalog_cache and (
-        current_time - catalog_cache.get("last_updated", 0) < CACHE_TIMEOUT
-    ):
-        return catalog_cache["data"]
+    async with stream_cache_lock:
+        cached = stream_cache.get(match_id)
+        if not cached:
+            return None
 
-    try:
-        resp = requests.get(f"{API_BASE}/matches/all-today", timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-        data.sort(key=lambda x: x.get("date", 0))
-        catalog_cache = {"last_updated": current_time, "data": data}
-        return data
-    except Exception as e:
-        logging.error(f"Failed to fetch matches: {e}")
-        return catalog_cache.get("data", [])
+        if current_time < cached["expires_at"]:
+            return cached["streams_list"]
+
+        del stream_cache[match_id]
+
+    return None
+
+
+async def set_cached_streams(match_id: str, streams_list: List[Dict]) -> None:
+    async with stream_cache_lock:
+        stream_cache[match_id] = {
+            "streams_list": streams_list,
+            "expires_at": time.time() + STREAM_CACHE_DURATION,
+        }
 
 
 def get_poster_url(match: Dict) -> str:
@@ -110,7 +173,8 @@ async def get_all_stream_embeds(match_id: str) -> List[Dict]:
         source_id = src["id"]
         try:
             api_url = f"{API_BASE}/stream/{source_name}/{source_id}"
-            resp = requests.get(api_url, timeout=5)
+            client = await get_upstream_client()
+            resp = await client.get(api_url, timeout=5.0)
             if resp.status_code == 200:
                 streams_data = resp.json()
                 for stream_obj in streams_data:
@@ -556,7 +620,7 @@ async def catalog(type, id, genre=None):
 
 
 # --- WORKER ---
-async def process_stream_option(embed_data, browser, semaphore):
+async def process_stream_option(embed_data, browser, local_semaphore):
     embed_url = embed_data["embed_url"]
     label = embed_data["label"]
     source = embed_data.get("source", "")
@@ -575,22 +639,27 @@ async def process_stream_option(embed_data, browser, semaphore):
         queued_at,
     )
 
+    started_at = None
+
     try:
-        async with semaphore:
-            started_at = time.time()
-            logging.info(
-                "Resolver started: source=%s label=%s embed=%s waited=%.2fs started_at=%.3f",
-                source,
-                label,
-                embed_url,
-                started_at - queued_at,
-                started_at,
-            )
-            data = await asyncio.wait_for(
-                resolve_with_playwright(embed_url, browser),
-                timeout=PER_EMBED_TIMEOUT,
-            )
+        async with local_semaphore:
+            async with global_resolver_semaphore:
+                started_at = time.time()
+                logging.info(
+                    "Resolver started: source=%s label=%s embed=%s waited=%.2fs started_at=%.3f",
+                    source,
+                    label,
+                    embed_url,
+                    started_at - queued_at,
+                    started_at,
+                )
+                data = await asyncio.wait_for(
+                    resolve_with_playwright(embed_url, browser),
+                    timeout=PER_EMBED_TIMEOUT,
+                )
     except asyncio.TimeoutError:
+        if started_at is None:
+            started_at = time.time()
         logging.warning(
             "Resolver timed out: source=%s label=%s embed=%s waited=%.2fs ran=%.2fs",
             source,
@@ -601,6 +670,8 @@ async def process_stream_option(embed_data, browser, semaphore):
         )
         return None
     except Exception as exc:
+        if started_at is None:
+            started_at = time.time()
         logging.error(
             "Resolver failed: source=%s label=%s embed=%s waited=%.2fs ran=%.2fs error=%s",
             source,
@@ -668,35 +739,24 @@ async def process_stream_option(embed_data, browser, semaphore):
         }
 
 
-@app.route("/stream/<type>/<id>.json")
-async def stream(type, id):
-    if not id.startswith("pk_"):
-        return jsonify({"streams": []})
-
-    real_match_id = id.replace("pk_", "")
-    current_time = time.time()
-
-    if real_match_id in stream_cache:
-        cached = stream_cache[real_match_id]
-        if current_time < cached["expires_at"]:
-            logging.info(f"CACHE HIT: {real_match_id}")
-            return jsonify({"streams": cached["streams_list"]})
-        else:
-            del stream_cache[real_match_id]
+async def resolve_streams_for_match(real_match_id: str) -> List[Dict]:
+    cached_streams = await get_cached_streams(real_match_id)
+    if cached_streams is not None:
+        return cached_streams
 
     embeds_list = await get_all_stream_embeds(real_match_id)
     if not embeds_list:
-        return jsonify({"streams": []})
+        return []
 
     logging.info(
-        "Resolving %s options concurrently (max %s, total timeout %.1fs, per-embed timeout %.1fs)...",
+        "Resolving %s options concurrently (per-request max %s, global max %s, total timeout %.1fs, per-embed timeout %.1fs)...",
         len(embeds_list),
         MAX_CONCURRENT_RESOLVERS,
+        MAX_GLOBAL_CONCURRENT_RESOLVERS,
         STREAM_RESOLUTION_TIMEOUT,
         PER_EMBED_TIMEOUT,
     )
 
-    # --- Shared Browser + Concurrency Limit ---
     async with async_playwright() as p:
         try:
             browser = await p.chromium.launch(
@@ -724,9 +784,9 @@ async def stream(type, id):
             )
             logging.info("Launched Playwright browser with bundled Chromium")
 
-        semaphore = asyncio.Semaphore(MAX_CONCURRENT_RESOLVERS)
+        local_semaphore = asyncio.Semaphore(MAX_CONCURRENT_RESOLVERS)
         tasks = [
-            asyncio.create_task(process_stream_option(e, browser, semaphore))
+            asyncio.create_task(process_stream_option(e, browser, local_semaphore))
             for e in embeds_list
         ]
 
@@ -777,13 +837,51 @@ async def stream(type, id):
 
     valid_streams = [r for r in results if r]
 
-    if not valid_streams:
+    if valid_streams:
+        await set_cached_streams(real_match_id, valid_streams)
+
+    return valid_streams
+
+
+async def get_or_resolve_streams(real_match_id: str) -> List[Dict]:
+    cached_streams = await get_cached_streams(real_match_id)
+    if cached_streams is not None:
+        logging.info(f"CACHE HIT: {real_match_id}")
+        return cached_streams
+
+    created_task = False
+
+    async with in_flight_streams_lock:
+        task = in_flight_stream_requests.get(real_match_id)
+        if task is None:
+            task = asyncio.create_task(resolve_streams_for_match(real_match_id))
+            in_flight_stream_requests[real_match_id] = task
+            created_task = True
+            logging.info("Started in-flight resolution for %s", real_match_id)
+        else:
+            logging.info("Joining in-flight resolution for %s", real_match_id)
+
+    try:
+        return await asyncio.shield(task)
+    finally:
+        if created_task:
+            async with in_flight_streams_lock:
+                if in_flight_stream_requests.get(real_match_id) is task:
+                    del in_flight_stream_requests[real_match_id]
+
+
+@app.route("/stream/<type>/<id>.json")
+async def stream(type, id):
+    if not id.startswith("pk_"):
         return jsonify({"streams": []})
 
-    stream_cache[real_match_id] = {
-        "streams_list": valid_streams,
-        "expires_at": current_time + STREAM_CACHE_DURATION,
-    }
+    real_match_id = id.replace("pk_", "")
+
+    try:
+        valid_streams = await get_or_resolve_streams(real_match_id)
+    except Exception as exc:
+        logging.error("Stream resolution failed for %s: %s", real_match_id, exc)
+        return jsonify({"streams": []})
 
     return jsonify({"streams": valid_streams})
 
