@@ -40,6 +40,11 @@ PER_EMBED_TIMEOUT = float(os.environ.get("PER_EMBED_TIMEOUT", "25"))
 PLAYWRIGHT_INTERACTION_ATTEMPTS = int(
     os.environ.get("PLAYWRIGHT_INTERACTION_ATTEMPTS", "7")
 )
+ENABLE_PLAYWRIGHT_STEALTH = os.environ.get("ENABLE_PLAYWRIGHT_STEALTH", "").lower() in {
+    "1",
+    "true",
+    "yes",
+}
 RESOLVER_DEBUG = os.environ.get("RESOLVER_DEBUG", "").lower() in {"1", "true", "yes"}
 RESOLVER_DEBUG_SOURCES = {
     source.strip().lower()
@@ -50,7 +55,7 @@ PLAYWRIGHT_LOCALE = os.environ.get("PLAYWRIGHT_LOCALE", "en-US")
 PLAYWRIGHT_TIMEZONE = os.environ.get("PLAYWRIGHT_TIMEZONE", "America/Chicago")
 STEALTH = (
     Stealth(navigator_languages_override=("en-US", "en"), init_scripts_only=True)
-    if Stealth is not None
+    if Stealth is not None and ENABLE_PLAYWRIGHT_STEALTH
     else None
 )
 
@@ -807,13 +812,23 @@ async def stream(type, id):
                     "--disable-gpu",
                     "--mute-audio",
                     "--disable-blink-features=AutomationControlled",
+                    "--disable-dev-shm-usage",
                 ],
             )
+            logging.info("Launched Playwright browser with channel=chrome")
         except Exception:
+            logging.warning(
+                "Falling back to bundled Chromium because channel=chrome launch failed"
+            )
             browser = await p.chromium.launch(
                 headless=True,
-                args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+                args=[
+                    "--no-sandbox",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-dev-shm-usage",
+                ],
             )
+            logging.info("Launched Playwright browser with bundled Chromium")
 
         semaphore = asyncio.Semaphore(MAX_CONCURRENT_RESOLVERS)
         tasks = [
