@@ -10,7 +10,15 @@ from typing import Dict, List, Optional
 from urllib.parse import quote, unquote, urljoin, urlparse
 
 import httpx
-from quart import Quart, jsonify, send_from_directory, url_for, request, Response
+from quart import (
+    Quart,
+    jsonify,
+    send_from_directory,
+    url_for,
+    request,
+    Response,
+    render_template,
+)
 from quart_cors import cors
 from playwright.async_api import async_playwright
 
@@ -32,9 +40,7 @@ STREAM_CACHE_DURATION = 900
 SECRET_KEY = os.environ.get("PROXY_SECRET_KEY", "change-me-to-a-real-secret")
 MAX_CONCURRENT_RESOLVERS = int(os.environ.get("MAX_CONCURRENT_RESOLVERS", "2"))
 MAX_GLOBAL_CONCURRENT_RESOLVERS = int(
-    os.environ.get(
-        "MAX_GLOBAL_CONCURRENT_RESOLVERS", str(MAX_CONCURRENT_RESOLVERS)
-    )
+    os.environ.get("MAX_GLOBAL_CONCURRENT_RESOLVERS", str(MAX_CONCURRENT_RESOLVERS))
 )
 STREAM_RESOLUTION_TIMEOUT = float(os.environ.get("STREAM_RESOLUTION_TIMEOUT", "55"))
 PER_EMBED_TIMEOUT = float(os.environ.get("PER_EMBED_TIMEOUT", "25"))
@@ -555,6 +561,20 @@ async def proxy_stream():
 # --- Standard Routes ---
 
 
+@app.route("/")
+@app.route("/home")
+async def home():
+    manifest_url = url_for("manifest", _external=True)
+    manifest_url_no_protocol = manifest_url.replace("https://", "").replace(
+        "http://", ""
+    )
+    return await render_template(
+        "home.html",
+        manifest_url=manifest_url,
+        manifest_url_no_protocol=manifest_url_no_protocol,
+    )
+
+
 @app.route("/logo.png")
 async def serve_logo():
     return await send_from_directory(".", "SportsSphereLogo.png")
@@ -701,7 +721,9 @@ async def process_stream_option(embed_data, browser, local_semaphore):
     stream_url = data["url"]
     headers = data["headers"]
     clean_root = data.get("clean_root", "")
-    normalized_headers = normalize_stream_headers(stream_url, headers, clean_root, source)
+    normalized_headers = normalize_stream_headers(
+        stream_url, headers, clean_root, source
+    )
 
     # Golf streams need correct exposestrat.com Referer (captured by actual_referer fix above)
     if source == "golf":
