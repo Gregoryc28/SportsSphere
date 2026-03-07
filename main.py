@@ -108,14 +108,23 @@ async def get_all_stream_embeds(match_id: str) -> List[Dict]:
                     label = f"{source_name.title()} - Stream {stream_no} ({quality})"
 
                     found_embeds.append(
-                        {"label": label, "source": source_name, "embed_url": embed_url}
+                        {
+                            "label": label,
+                            "source": source_name,
+                            "embed_url": embed_url,
+                            "stream_no": stream_no,
+                        }
                     )
         except Exception:
             continue
 
     # --- Priority Sorting: fastest/most reliable sources first ---
-    def _embed_sort_key(embed):
-        source = embed.get("source", "").lower()
+    def _source_priority(embed_or_source):
+        source = embed_or_source
+        if isinstance(embed_or_source, dict):
+            source = embed_or_source.get("source", "")
+
+        source = source.lower()
         if "golf" in source:
             return 0
         if "admin" in source:
@@ -124,8 +133,28 @@ async def get_all_stream_embeds(match_id: str) -> List[Dict]:
             return 2
         return 3
 
-    found_embeds.sort(key=_embed_sort_key)
-    return found_embeds
+    found_embeds.sort(key=lambda embed: (_source_priority(embed), embed["stream_no"]))
+
+    source_buckets = {}
+    for embed in found_embeds:
+        source_key = embed.get("source", "").lower()
+        source_buckets.setdefault(source_key, []).append(embed)
+
+    ordered_sources = sorted(source_buckets, key=_source_priority)
+    interleaved_embeds = []
+
+    while True:
+        progressed = False
+        for source_key in ordered_sources:
+            bucket = source_buckets.get(source_key, [])
+            if bucket:
+                interleaved_embeds.append(bucket.pop(0))
+                progressed = True
+
+        if not progressed:
+            break
+
+    return interleaved_embeds
 
 
 async def resolve_with_playwright(embed_url: str, browser) -> Optional[Dict]:
@@ -149,10 +178,13 @@ async def resolve_with_playwright(embed_url: str, browser) -> Optional[Dict]:
     BLOCKED_RESOURCE_TYPES = {"image", "stylesheet", "font", "media"}
 
     async def block_unnecessary_resources(route):
-        if route.request.resource_type in BLOCKED_RESOURCE_TYPES:
-            await route.abort()
-        else:
-            await route.continue_()
+        try:
+            if route.request.resource_type in BLOCKED_RESOURCE_TYPES:
+                await route.abort()
+            else:
+                await route.continue_()
+        except Exception:
+            pass
 
     await page.route("**/*", block_unnecessary_resources)
 
