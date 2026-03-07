@@ -30,6 +30,9 @@ STREAMED_HOST = "https://streamed.pk"
 CACHE_TIMEOUT = 300
 STREAM_CACHE_DURATION = 900
 SECRET_KEY = os.environ.get("PROXY_SECRET_KEY", "change-me-to-a-real-secret")
+MAX_CONCURRENT_RESOLVERS = int(os.environ.get("MAX_CONCURRENT_RESOLVERS", "3"))
+STREAM_RESOLUTION_TIMEOUT = float(os.environ.get("STREAM_RESOLUTION_TIMEOUT", "30"))
+PER_EMBED_TIMEOUT = float(os.environ.get("PER_EMBED_TIMEOUT", "15"))
 
 # Global Caches
 catalog_cache = {}
@@ -399,20 +402,63 @@ async def catalog(type, id, genre=None):
 async def process_stream_option(embed_data, browser, semaphore):
     embed_url = embed_data["embed_url"]
     label = embed_data["label"]
+    source = embed_data.get("source", "")
+    started_at = time.time()
 
     # If label starts with "Admin", change "Admin" text to "Alpha"
     if label.startswith("Admin"):
         label = label.replace("Admin", "Alpha")
 
-    async with semaphore:
-        data = await resolve_with_playwright(embed_url, browser)
+    logging.info(
+        "Resolver started: source=%s label=%s embed=%s started_at=%.3f",
+        source,
+        label,
+        embed_url,
+        started_at,
+    )
+
+    try:
+        async with semaphore:
+            data = await asyncio.wait_for(
+                resolve_with_playwright(embed_url, browser), timeout=PER_EMBED_TIMEOUT
+            )
+    except asyncio.TimeoutError:
+        logging.warning(
+            "Resolver timed out: source=%s label=%s embed=%s elapsed=%.2fs",
+            source,
+            label,
+            embed_url,
+            time.time() - started_at,
+        )
+        return None
+    except Exception as exc:
+        logging.error(
+            "Resolver failed: source=%s label=%s embed=%s elapsed=%.2fs error=%s",
+            source,
+            label,
+            embed_url,
+            time.time() - started_at,
+            exc,
+        )
+        return None
+
+    status = "resolved" if data and "url" in data else "no_stream"
+    logging.info(
+        "Resolver finished: source=%s label=%s status=%s embed=%s elapsed=%.2fs finished_at=%.3f",
+        source,
+        label,
+        status,
+        embed_url,
+        time.time() - started_at,
+        time.time(),
+    )
+
     if not data or "url" not in data:
         return None
 
     stream_url = data["url"]
     headers = data["headers"]
     clean_root = data.get("clean_root", "")
-    source = embed_data.get("source", "")
 
     # Golf streams need correct exposestrat.com Referer (captured by actual_referer fix above)
     if source == "golf":
@@ -472,7 +518,13 @@ async def stream(type, id):
     if not embeds_list:
         return jsonify({"streams": []})
 
-    logging.info(f"Resolving {len(embeds_list)} options concurrently (max 2)...")
+    logging.info(
+        "Resolving %s options concurrently (max %s, total timeout %.1fs, per-embed timeout %.1fs)...",
+        len(embeds_list),
+        MAX_CONCURRENT_RESOLVERS,
+        STREAM_RESOLUTION_TIMEOUT,
+        PER_EMBED_TIMEOUT,
+    )
 
     # --- Shared Browser + Concurrency Limit ---
     async with async_playwright() as p:
@@ -493,29 +545,54 @@ async def stream(type, id):
                 args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
             )
 
-        semaphore = asyncio.Semaphore(2)
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_RESOLVERS)
         tasks = [
             asyncio.create_task(process_stream_option(e, browser, semaphore))
             for e in embeds_list
         ]
 
-        # --- Soft Timeout: return whatever resolved within the window ---
-        try:
-            results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=14)
-        except asyncio.TimeoutError:
-            logging.warning("Partial result returned due to timeout")
-            # Cancel any still-pending tasks
-            for t in tasks:
-                if not t.done():
-                    t.cancel()
-            # Collect results from tasks that already finished
-            results = []
-            for t in tasks:
-                if t.done() and not t.cancelled():
-                    try:
-                        results.append(t.result())
-                    except Exception:
-                        results.append(None)
+        pending_tasks = set(tasks)
+        results = []
+        deadline = time.monotonic() + STREAM_RESOLUTION_TIMEOUT
+
+        while pending_tasks:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logging.warning(
+                    "Partial result returned due to timeout: completed=%s pending=%s budget=%.1fs",
+                    len(results),
+                    len(pending_tasks),
+                    STREAM_RESOLUTION_TIMEOUT,
+                )
+                break
+
+            done, pending_tasks = await asyncio.wait(
+                pending_tasks,
+                timeout=remaining,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            if not done:
+                logging.warning(
+                    "Partial result returned due to timeout: completed=%s pending=%s budget=%.1fs",
+                    len(results),
+                    len(pending_tasks),
+                    STREAM_RESOLUTION_TIMEOUT,
+                )
+                break
+
+            for task in done:
+                try:
+                    results.append(task.result())
+                except Exception as exc:
+                    logging.error(f"Unhandled resolver task failure: {exc}")
+                    results.append(None)
+
+        for task in pending_tasks:
+            task.cancel()
+
+        if pending_tasks:
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
 
         await browser.close()
 
