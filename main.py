@@ -30,9 +30,9 @@ STREAMED_HOST = "https://streamed.pk"
 CACHE_TIMEOUT = 300
 STREAM_CACHE_DURATION = 900
 SECRET_KEY = os.environ.get("PROXY_SECRET_KEY", "change-me-to-a-real-secret")
-MAX_CONCURRENT_RESOLVERS = int(os.environ.get("MAX_CONCURRENT_RESOLVERS", "3"))
-STREAM_RESOLUTION_TIMEOUT = float(os.environ.get("STREAM_RESOLUTION_TIMEOUT", "30"))
-PER_EMBED_TIMEOUT = float(os.environ.get("PER_EMBED_TIMEOUT", "15"))
+MAX_CONCURRENT_RESOLVERS = int(os.environ.get("MAX_CONCURRENT_RESOLVERS", "2"))
+STREAM_RESOLUTION_TIMEOUT = float(os.environ.get("STREAM_RESOLUTION_TIMEOUT", "45"))
+PER_EMBED_TIMEOUT = float(os.environ.get("PER_EMBED_TIMEOUT", "25"))
 
 # Global Caches
 catalog_cache = {}
@@ -403,40 +403,51 @@ async def process_stream_option(embed_data, browser, semaphore):
     embed_url = embed_data["embed_url"]
     label = embed_data["label"]
     source = embed_data.get("source", "")
-    started_at = time.time()
+    queued_at = time.time()
 
     # If label starts with "Admin", change "Admin" text to "Alpha"
     if label.startswith("Admin"):
         label = label.replace("Admin", "Alpha")
 
     logging.info(
-        "Resolver started: source=%s label=%s embed=%s started_at=%.3f",
+        "Resolver queued: source=%s label=%s embed=%s queued_at=%.3f",
         source,
         label,
         embed_url,
-        started_at,
+        queued_at,
     )
 
     try:
         async with semaphore:
+            started_at = time.time()
+            logging.info(
+                "Resolver started: source=%s label=%s embed=%s waited=%.2fs started_at=%.3f",
+                source,
+                label,
+                embed_url,
+                started_at - queued_at,
+                started_at,
+            )
             data = await asyncio.wait_for(
                 resolve_with_playwright(embed_url, browser), timeout=PER_EMBED_TIMEOUT
             )
     except asyncio.TimeoutError:
         logging.warning(
-            "Resolver timed out: source=%s label=%s embed=%s elapsed=%.2fs",
+            "Resolver timed out: source=%s label=%s embed=%s waited=%.2fs ran=%.2fs",
             source,
             label,
             embed_url,
+            started_at - queued_at,
             time.time() - started_at,
         )
         return None
     except Exception as exc:
         logging.error(
-            "Resolver failed: source=%s label=%s embed=%s elapsed=%.2fs error=%s",
+            "Resolver failed: source=%s label=%s embed=%s waited=%.2fs ran=%.2fs error=%s",
             source,
             label,
             embed_url,
+            started_at - queued_at,
             time.time() - started_at,
             exc,
         )
@@ -444,11 +455,12 @@ async def process_stream_option(embed_data, browser, semaphore):
 
     status = "resolved" if data and "url" in data else "no_stream"
     logging.info(
-        "Resolver finished: source=%s label=%s status=%s embed=%s elapsed=%.2fs finished_at=%.3f",
+        "Resolver finished: source=%s label=%s status=%s embed=%s waited=%.2fs ran=%.2fs finished_at=%.3f",
         source,
         label,
         status,
         embed_url,
+        started_at - queued_at,
         time.time() - started_at,
         time.time(),
     )
