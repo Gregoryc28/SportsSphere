@@ -564,10 +564,8 @@ async def proxy_stream():
 @app.route("/")
 @app.route("/home")
 async def home():
-    manifest_url = url_for("manifest", _external=True)
-    manifest_url_no_protocol = manifest_url.replace("https://", "").replace(
-        "http://", ""
-    )
+    manifest_url = url_for("manifest", _external=True).replace("http://", "https://")
+    manifest_url_no_protocol = manifest_url.replace("https://", "")
     return await render_template(
         "home.html",
         manifest_url=manifest_url,
