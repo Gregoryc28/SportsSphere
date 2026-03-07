@@ -51,6 +51,19 @@ def sign_url(url: str) -> str:
     return hmac.new(SECRET_KEY.encode(), url.encode(), hashlib.sha256).hexdigest()
 
 
+def normalize_stream_headers(
+    stream_url: str, headers: Dict[str, str], clean_root: str, source: str
+) -> Dict[str, str]:
+    normalized_headers = headers.copy()
+    strict_domains = ("strmd.top", "delta", "modifiles.fans")
+
+    if source != "golf" and any(domain in stream_url for domain in strict_domains):
+        normalized_headers["Referer"] = clean_root
+        normalized_headers.pop("Origin", None)
+
+    return normalized_headers
+
+
 async def get_all_matches() -> List[Dict]:
     global catalog_cache
     current_time = time.time()
@@ -616,18 +629,19 @@ async def process_stream_option(embed_data, browser, semaphore):
     stream_url = data["url"]
     headers = data["headers"]
     clean_root = data.get("clean_root", "")
+    normalized_headers = normalize_stream_headers(stream_url, headers, clean_root, source)
 
     # Golf streams need correct exposestrat.com Referer (captured by actual_referer fix above)
     if source == "golf":
         logging.info(
-            f"Golf stream direct with Referer: {headers.get('Referer', 'N/A')}"
+            f"Golf stream direct with Referer: {normalized_headers.get('Referer', 'N/A')}"
         )
         return {
             "title": f"{label} (Direct)",
             "url": stream_url,
             "behaviorHints": {
                 "notWebReady": True,
-                "proxyHeaders": {"request": headers},
+                "proxyHeaders": {"request": normalized_headers},
             },
         }
 
@@ -637,10 +651,7 @@ async def process_stream_option(embed_data, browser, semaphore):
     )
 
     if is_strict:
-        proxy_headers = headers.copy()
-        proxy_headers["Referer"] = clean_root
-        if "Origin" in proxy_headers:
-            del proxy_headers["Origin"]
+        proxy_headers = normalized_headers.copy()
 
         headers_json = json.dumps(proxy_headers)
         headers_b64 = base64.b64encode(headers_json.encode("utf-8")).decode("utf-8")
@@ -653,7 +664,7 @@ async def process_stream_option(embed_data, browser, semaphore):
             "url": stream_url,
             "behaviorHints": {
                 "notWebReady": True,
-                "proxyHeaders": {"request": headers},
+                "proxyHeaders": {"request": normalized_headers},
             },
         }
 
