@@ -13,6 +13,10 @@ import requests
 from quart import Quart, jsonify, send_from_directory, url_for, request, Response
 from quart_cors import cors
 from playwright.async_api import async_playwright
+try:
+    from playwright_stealth import Stealth
+except ImportError:
+    Stealth = None
 
 # --- NEW: Impersonation Library for the Proxy ---
 from curl_cffi import requests as cffi_requests
@@ -44,6 +48,11 @@ RESOLVER_DEBUG_SOURCES = {
 }
 PLAYWRIGHT_LOCALE = os.environ.get("PLAYWRIGHT_LOCALE", "en-US")
 PLAYWRIGHT_TIMEZONE = os.environ.get("PLAYWRIGHT_TIMEZONE", "America/Chicago")
+STEALTH = (
+    Stealth(navigator_languages_override=("en-US", "en"), init_scripts_only=True)
+    if Stealth is not None
+    else None
+)
 
 # Global Caches
 catalog_cache = {}
@@ -229,6 +238,11 @@ async def resolve_with_playwright(
         locale=PLAYWRIGHT_LOCALE,
         timezone_id=PLAYWRIGHT_TIMEZONE,
     )
+    if STEALTH is not None:
+        try:
+            await STEALTH.apply_stealth_async(context)
+        except Exception as e:
+            logging.warning(f"Failed to apply Playwright stealth: {e}")
     await context.set_extra_http_headers(
         {
             "Accept-Language": "en-US,en;q=0.9",
